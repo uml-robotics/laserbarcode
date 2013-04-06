@@ -31,6 +31,9 @@
 
 #include <ros/ros.h>
 #include <sensor_msgs/LaserScan.h>
+#include <tf/tfMessage.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <sstream>
 
 #include "player/laserbarcode.h"
 
@@ -57,7 +60,8 @@ int main(int argc, char **argv)
 }
 
 LaserBarcodeNode::LaserBarcodeNode() :
-        sub_laser_(nh_.subscribe("scan", 5, &LaserBarcodeNode::LaserCallback, this))
+        sub_laser_(nh_.subscribe("scan", 5, &LaserBarcodeNode::LaserCallback, this)),
+        pub_fiducials_(nh_.advertise<tf::tfMessage>("/tf", 5))
 {
   lb_.Setup();
 }
@@ -82,9 +86,30 @@ void LaserBarcodeNode::LaserCallback(const sensor_msgs::LaserScanConstPtr & scan
   {
     intensities.push_back(scan->intensities[i]);
   }
-  player_scan.intensity =(uint8_t *) &intensities;
+  player_scan.intensity = (uint8_t *)&intensities;
   player_scan.id = scan->header.seq;
 
   lb_.ProcessMessage(&player_scan);
-  ROS_INFO("Found %d fiducials.", lb_.data.fiducials_count);
+
+  // Use tf messages to publish fiducials, no need for custom messages
+  tf::tfMessage tf_msg;
+  geometry_msgs::TransformStamped tr;
+  tr.header = scan->header;
+
+  for (uint i = 0; i < lb_.data.fiducials_count; i++)
+  {
+    Player::player_fiducial_item_t & fiducial = lb_.data.fiducials[i];
+    if (fiducial.id > 0)
+    {
+      std::stringstream ss;
+      ss << fiducial.id;
+      tr.child_frame_id = ss.str();
+      tr.transform.rotation.w = 1;
+      tr.transform.translation.x = fiducial.pose.px;
+      tr.transform.translation.y = fiducial.pose.py;
+      tr.transform.translation.z = fiducial.pose.pz;
+      tf_msg.transforms.push_back(tr);
+    }
+  }
+  pub_fiducials_.publish(tf_msg);
 }
