@@ -121,108 +121,33 @@ driver
 */
 /** @} */
 
-#define PLAYER_ENABLE_TRACE 0
-#define PLAYER_ENABLE_MSG 0
-
 #include <errno.h>
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>  // for atoi(3)
 #include <netinet/in.h>  /* for htons(3) */
 #include <unistd.h>
+#include <assert.h>
 
-#include <libplayercore/playercore.h>
+#include "laserbarcode.h"
 
-// The laser barcode detector.
-class LaserBarcode : public Driver
-{
-  // Constructor
-  public: LaserBarcode( ConfigFile* cf, int section);
-
-  // Setup/shutdown routines
-  //
-  public: virtual int Setup();
-  public: virtual int Shutdown();
-
-  // Process incoming messages from clients
-  int ProcessMessage (QueuePointer &resp_queue, player_msghdr * hdr, void * data);
-
-  // Main function for device thread
-  //private: virtual void Main(void);
-
-  // Get the laser data
-  //private: int ReadLaser();
-
-  // Analyze the laser data and return beacon data
-  private: void FindBeacons(const player_laser_data_t *laser_data,
-                            player_fiducial_data_t *beacon_data);
-
-  // Analyze the candidate beacon and return its id (0 == none)
-  private: int IdentBeacon(int a, int b, double ox, double oy, double oth,
-                           const player_laser_data_t *laser_data);
-
-  // Write fidicual data
-  private: void WriteFiducial();
-
-  // Pointer to laser to get data from
-  private: player_devaddr_t laser_id;
-  private: Device *laser;
-
-  // Magic numbers
-  private: int bit_count;
-  private: double bit_width;
-  private: double max_depth;
-  private: double accept_thresh, zero_thresh, one_thresh;
-
-  // Current laser data
-  private: player_laser_data_t laser_data;
-  private: struct timeval laser_timestamp;
-
-  // Current fiducial data
-  private: player_fiducial_data_t data;
-  unsigned int fdata_allocated;
-};
-
-
-// Initialization function
-Driver* LaserBarcode_Init( ConfigFile* cf, int section)
-{
-  return((Driver*)(new LaserBarcode( cf, section)));
-}
-
-// a driver registration function
-void LaserBarcode_Register(DriverTable* table)
-{
-  table->AddDriver("laserbarcode", LaserBarcode_Init);
-}
-
-
+namespace Player{
 ////////////////////////////////////////////////////////////////////////////////
 // Constructor
-LaserBarcode::LaserBarcode( ConfigFile* cf, int section)
-  : Driver(cf, section, true, PLAYER_MSGQUEUE_DEFAULT_MAXLEN, PLAYER_FIDUCIAL_CODE)
+LaserBarcode::LaserBarcode()
+  : Driver(),
+        // Get beacon settings.
+        bit_count(8), //
+        bit_width(0.05), //
+
+        // Maximum variance in the flatness of the beacon
+        max_depth(0.05), //
+
+        // Default thresholds
+        accept_thresh(1.0), //
+        zero_thresh(0.60), //
+        one_thresh(0.60)
 {
-  // Must have an input laser
-  if (cf->ReadDeviceAddr(&this->laser_id, section, "requires",
-                       PLAYER_LASER_CODE, -1, NULL) != 0)
-  {
-    this->SetError(-1);
-    return;
-  }
-
-  // Get beacon settings.
-  this->bit_count = cf->ReadInt(section, "bit_count", 8);
-  this->bit_width = cf->ReadLength(section, "bit_width", 0.05);
-
-  // Maximum variance in the flatness of the beacon
-  this->max_depth = cf->ReadLength(section, "max_depth", 0.05);
-
-  // Default thresholds
-  this->accept_thresh = cf->ReadFloat(section, "accept_thresh", 1.0);
-  this->zero_thresh = cf->ReadFloat(section, "zero_thresh", 0.60);
-  this->one_thresh = cf->ReadFloat(section, "one_thresh", 0.60);
-
-  return;
 }
 
 
@@ -233,26 +158,8 @@ int LaserBarcode::Setup()
   fdata_allocated = 0;
   data.fiducials = NULL;
 
-  // Subscribe to the laser.
-  if (Device::MatchDeviceAddress (laser_id, device_addr))
-  {
-    PLAYER_ERROR ("attempt to subscribe to self");
-    return -1;
-  }
-  if (!(laser = deviceTable->GetDevice (laser_id)))
-  {
-    PLAYER_ERROR ("unable to locate suitable camera device");
-    return -1;
-  }
-  if (laser->Subscribe (InQueue) != 0)
-  {
-    PLAYER_ERROR ("unable to subscribe to camera device");
-    return -1;
-  }
-
-
-  PLAYER_MSG2(2, "laserbarcode device: bitcount [%d] bitwidth [%fm]",
-              this->bit_count, this->bit_width);
+//  PLAYER_MSG2(2, "laserbarcode device: bitcount [%d] bitwidth [%fm]",
+//              this->bit_count, this->bit_width);
   return 0;
 }
 
@@ -261,38 +168,25 @@ int LaserBarcode::Setup()
 // Shutdown the device
 int LaserBarcode::Shutdown()
 {
-
-  // Unsubscribe from devices.
-  laser->Unsubscribe(InQueue);
-
   free(data.fiducials);
-
-  PLAYER_MSG0(2, "laserbarcode device: shutdown");
+//  PLAYER_MSG0(2, "laserbarcode device: shutdown");
   return 0;
 }
 
 
-
 ////////////////////////////////////////////////////////////////////////////////
 // Process an incoming message
-int LaserBarcode::ProcessMessage (QueuePointer &resp_queue, player_msghdr * hdr, void * data)
+int LaserBarcode::ProcessMessage (player_laser_data_t * data)
 {
-  assert(hdr);
+  laser_data = *data;
 
-  if(Message::MatchMessage (hdr, PLAYER_MSGTYPE_DATA, PLAYER_LASER_DATA_SCAN, laser_id))
-  {
-    laser_data = *reinterpret_cast<player_laser_data_t * > (data);
+  // Analyse the laser data
+  this->FindBeacons(&this->laser_data, &this->data);
 
-    // Analyse the laser data
-    this->FindBeacons(&this->laser_data, &this->data);
+  // Write out the fiducials
+  this->WriteFiducial();
 
-    // Write out the fiducials
-    this->WriteFiducial();
-
-    return 0;
-  }
-
-  return -1;
+  return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -501,8 +395,9 @@ int LaserBarcode::IdentBeacon(int a, int b, double ox, double oy, double oth,
 void LaserBarcode::WriteFiducial()
 {
   // Write the data with the laser timestamp
-  this->Publish(device_addr, PLAYER_MSGTYPE_DATA, PLAYER_FIDUCIAL_DATA_SCAN, &this->data);
+//  this->Publish(device_addr, PLAYER_MSGTYPE_DATA, PLAYER_FIDUCIAL_DATA_SCAN, &this->data);
 
   return;
 }
 
+}/* namespace Player */
