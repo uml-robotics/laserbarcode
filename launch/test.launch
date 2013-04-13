@@ -1,0 +1,5 @@
+<launch>
+  <node name="laserbarcode_sick" type="laserbarcode_node" pkg="laserbarcode" output="screen" respawn="true">
+    <!--<remap from="scan" to="scan_sick"/>-->
+  </node>
+</launch>
